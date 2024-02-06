@@ -307,6 +307,13 @@ enum dll_init_context {
 
 static struct sdhci_msm_host *sdhci_slot[2];
 
+struct mmc_gpio {
+	struct gpio_desc *ro_gpio, *cd_gpio;
+	irqreturn_t (*cd_gpio_isr)(int irq, void *dev_id);
+	char *ro_label, *cd_label;
+	u32 cd_debounce_delay_ms;
+};
+
 static int sdhci_msm_update_qos_constraints(struct qos_cpu_group *qcg,
 					enum constraint type);
 static void sdhci_msm_bus_voting(struct sdhci_host *host, bool enable);
@@ -4611,6 +4618,133 @@ static void sdhci_msm_set_caps(struct sdhci_msm_host *msm_host)
 	msm_host->mmc->caps |= MMC_CAP_AGGRESSIVE_PM;
 	msm_host->mmc->caps |= MMC_CAP_WAIT_WHILE_BUSY | MMC_CAP_NEED_RSP_BUSY;
 }
+
+#if IS_ENABLED(CONFIG_HIBERNATION)
+static int sdhci_msm_prepare_hibernation(struct sdhci_msm_host *msm_host)
+{
+	struct mmc_host *mhost = msm_host->mmc;
+	int ret = 0;
+
+	if (!mhost->card)
+		return ret;
+
+	mmc_get_card(mhost->card, NULL);
+
+	/*
+	 * Increase usage_count of card and host device till
+	 * hibernation is over. This will ensure they will not runtime suspend.
+	 */
+	pm_runtime_get_noresume(mmc_dev(mhost));
+
+#if IS_ENABLED(CONFIG_MMC_SDHCI_MSM_SCALING)
+	if (sdhci_msm_mmc_can_scale_clk(msm_host)) {
+
+		/*
+		 * Disable clock scaling and mask host capability so that
+		 * we will run in max frequency during:
+		 *	1. Hibernation preparation and image creation
+		 *	2. After finding hibernation image during reboot
+		 *	3. Once hibernation image is loaded and till hibernation
+		 *	restore is complete.
+		 */
+		if (msm_host->clk_scaling.enable)
+			sdhci_msm_mmc_suspend_clk_scaling(mhost);
+
+		mhost->caps2 &= ~MMC_CAP2_CLK_SCALE;
+		msm_host->scale_caps = mhost->caps2;
+		msm_host->clk_scaling.state = MMC_LOAD_HIGH;
+
+		/* Set to max. frequency when disabling */
+		ret = sdhci_msm_mmc_clk_update_freq(msm_host, msm_host->clk_scaling_highest,
+				msm_host->clk_scaling.state);
+		if (ret && ret != -EAGAIN)
+			pr_err("%s: clock scale to %lu failed with error %d\n",
+					mmc_hostname(mhost), msm_host->clk_scaling_highest, ret);
+	}
+
+#endif
+
+	/* Free cd-gpio IRQ before going into Hibernation */
+	devm_free_irq(mhost->parent, mhost->slot.cd_irq, mhost);
+
+	mmc_put_card(mhost->card, NULL);
+	return ret;
+}
+
+static int sdhci_msm_post_hibernation(struct sdhci_msm_host *msm_host)
+{
+	struct mmc_host *mhost = msm_host->mmc;
+	struct mmc_gpio *ctx = (struct mmc_gpio *) mhost->slot.handler_priv;
+	int irq, ret = 0;
+
+	if (!mhost->card)
+		return ret;
+
+	mmc_get_card(mhost->card, NULL);
+
+#if IS_ENABLED(CONFIG_MMC_SDHCI_MSM_SCALING)
+	if (!(mhost->caps2 & MMC_CAP2_CLK_SCALE))
+		goto enable_pm;
+
+	/* Enable the clock scaling and set the host capability */
+	mhost->caps2 |= MMC_CAP2_CLK_SCALE;
+	msm_host->scale_caps = mhost->caps2;
+
+	if (!msm_host->clk_scaling.enable) {
+		sdhci_msm_mmc_resume_clk_scaling(mhost);
+		msm_host->clk_scaling.enable = true;
+	}
+enable_pm:
+#endif /* End of CONFIG_MMC_SDHCI_MSM_SCALING */
+	/*
+	 * Reduce usage count of card and host device so that they may
+	 * runtime suspend.
+	 */
+	pm_runtime_put_noidle(mmc_dev(mhost));
+
+	mmc_put_card(mhost->card, NULL);
+
+	/* Register cd-gpio IRQ Post Hibernation*/
+	irq = mhost->slot.cd_irq;
+	if (irq >= 0) {
+		ret = devm_request_threaded_irq(mhost->parent, irq,
+			NULL, ctx->cd_gpio_isr,
+			IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING |
+			IRQF_ONESHOT,
+			ctx->cd_label, mhost);
+	}
+
+	return ret;
+}
+
+static int sdhci_msm_hibernation_notifier(struct notifier_block *notify_block,
+			unsigned long mode, void *unused)
+{
+	struct sdhci_msm_host *msm_host;
+
+	if (!notify_block)
+		return -EINVAL;
+
+	msm_host = container_of(
+		notify_block, struct sdhci_msm_host, sdhci_msm_pm_notifier);
+
+	switch (mode) {
+	case PM_HIBERNATION_PREPARE:
+		sdhci_msm_prepare_hibernation(msm_host);
+		break;
+
+	case PM_POST_HIBERNATION:
+		sdhci_msm_post_hibernation(msm_host);
+		break;
+
+	default:
+		pr_debug("Unhandled mode!!\n");
+	}
+
+	return 0;
+}
+#endif /* End of CONFIG_HIBERNATION */
+
 /* RUMI W/A for SD card */
 static void sdhci_msm_set_rumi_bus_mode(struct sdhci_host *host)
 {
@@ -4997,6 +5131,17 @@ static int sdhci_msm_probe(struct platform_device *pdev)
 	pm_runtime_mark_last_busy(&pdev->dev);
 	pm_runtime_put_autosuspend(&pdev->dev);
 
+#if IS_ENABLED(CONFIG_HIBERNATION)
+	msm_host->sdhci_msm_pm_notifier.notifier_call
+		= sdhci_msm_hibernation_notifier;
+	ret = register_pm_notifier(&msm_host->sdhci_msm_pm_notifier);
+	if (ret) {
+		dev_err(&pdev->dev, "%s: register pm notifier failed: %d\n",
+				__func__, ret);
+		goto pm_runtime_disable;
+	}
+#endif
+
 	return 0;
 
 pm_runtime_disable:
@@ -5035,6 +5180,10 @@ static int sdhci_msm_remove(struct platform_device *pdev)
 	int i;
 	int dead = (readl_relaxed(host->ioaddr + SDHCI_INT_STATUS) ==
 		    0xffffffff);
+
+#if IS_ENABLED(CONFIG_HIBERNATION)
+	unregister_pm_notifier(&msm_host->sdhci_msm_pm_notifier);
+#endif
 
 	sdhci_remove_host(host, dead);
 
