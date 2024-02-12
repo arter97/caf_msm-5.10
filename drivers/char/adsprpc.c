@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2012-2021, The Linux Foundation. All rights reserved.
- * Copyright (c) 2022-2023, Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2022-2024, Qualcomm Innovation Center, Inc. All rights reserved.
  */
 
 /* Uncomment this block to log an error on every VERIFY failure */
@@ -436,7 +436,7 @@ struct smq_notif_rsp {
 struct smq_invoke_ctx {
 	struct hlist_node hn;
 	/* Async node to add to async job ctx list */
-	struct list_head asyncn;
+	struct hlist_node asyncn;
 	struct completion work;
 	int retval;
 	int pid;
@@ -475,6 +475,7 @@ struct smq_invoke_ctx {
 	uint32_t sc_interrupted;
 	struct fastrpc_file *fl_interrupted;
 	uint32_t handle_interrupted;
+	bool is_job_sent_to_remote_ss; /* Flag to check if job is sent to remote sub system */
 };
 
 struct fastrpc_ctx_lst {
@@ -483,7 +484,7 @@ struct fastrpc_ctx_lst {
 	/* Number of active contexts queued to DSP */
 	uint32_t num_active_ctxs;
 	/* Queue which holds all async job contexts of process */
-	struct list_head async_queue;
+	struct hlist_head async_queue;
 	/* Queue which holds all status notifications of process */
 	struct list_head notif_queue;
 };
@@ -2073,8 +2074,9 @@ static int context_alloc(struct fastrpc_file *fl, uint32_t kernel,
 	}
 
 	INIT_HLIST_NODE(&ctx->hn);
-	INIT_LIST_HEAD(&ctx->asyncn);
+	INIT_HLIST_NODE(&ctx->asyncn);
 	hlist_add_fake(&ctx->hn);
+	hlist_add_fake(&ctx->asyncn);
 	ctx->fl = fl;
 	ctx->maps = (struct fastrpc_mmap **)(&ctx[1]);
 	ctx->lpra = (remote_arg_t *)(&ctx->maps[bufs]);
@@ -2285,10 +2287,12 @@ static void fastrpc_queue_completed_async_job(struct smq_invoke_ctx *ctx)
 	spin_lock_irqsave(&fl->aqlock, flags);
 	if (ctx->is_early_wakeup)
 		goto bail;
-	list_add_tail(&ctx->asyncn, &fl->clst.async_queue);
-	atomic_add(1, &fl->async_queue_job_count);
-	ctx->is_early_wakeup = true;
-	wake_up_interruptible(&fl->async_wait_queue);
+	if (!hlist_unhashed(&ctx->asyncn)) {
+		hlist_add_head(&ctx->asyncn, &fl->clst.async_queue);
+		atomic_add(1, &fl->async_queue_job_count);
+		ctx->is_early_wakeup = true;
+		wake_up_interruptible(&fl->async_wait_queue);
+	}
 bail:
 	spin_unlock_irqrestore(&fl->aqlock, flags);
 }
@@ -2539,7 +2543,7 @@ static void context_list_ctor(struct fastrpc_ctx_lst *me)
 	INIT_HLIST_HEAD(&me->interrupted);
 	INIT_HLIST_HEAD(&me->pending);
 	me->num_active_ctxs = 0;
-	INIT_LIST_HEAD(&me->async_queue);
+	INIT_HLIST_HEAD(&me->async_queue);
 	INIT_LIST_HEAD(&me->notif_queue);
 }
 
@@ -3130,6 +3134,7 @@ static int fastrpc_invoke_send(struct smq_invoke_ctx *ctx,
 {
 	struct smq_msg *msg = &ctx->msg;
 	struct smq_msg msg_temp;
+	struct smq_invoke_ctx ctx_temp;
 	struct fastrpc_file *fl = ctx->fl;
 	struct fastrpc_channel_ctx *channel_ctx = NULL;
 	int err = 0, cid = -1;
@@ -3137,6 +3142,8 @@ static int fastrpc_invoke_send(struct smq_invoke_ctx *ctx,
 	int64_t ns = 0;
 	uint64_t xo_time_in_us = 0;
 	int isasync = (ctx->asyncjob.isasyncjob ? true : false);
+	unsigned long irq_flags = 0;
+	uint32_t index = 0;
 
 	if (!fl) {
 		err = -EBADF;
@@ -3182,13 +3189,26 @@ static int fastrpc_invoke_send(struct smq_invoke_ctx *ctx,
 		/*
 		 * After message is sent to DSP, async response thread could immediately
 		 * get the response and free context, which will result in a use-after-free
-		 * in this function. So use a local variable for message.
+		 * in this function. So use a local variable for message and context.
 		 */
 		memcpy(&msg_temp, msg, sizeof(struct smq_msg));
 		msg = &msg_temp;
+		memcpy(&ctx_temp, ctx, sizeof(struct smq_invoke_ctx));
+		index = (uint32_t)GET_TABLE_IDX_FROM_CTXID(ctx->ctxid);
 	}
-	err = rpmsg_send(channel_ctx->rpdev->ept, (void *)msg, sizeof(*msg));
-	mutex_unlock(&channel_ctx->rpmsg_mutex);
+	if (isasync) {
+		if (!err) {
+			/*
+			 * Validate the ctx as this could have been already
+			 * freed by async response.
+			 */
+			spin_lock_irqsave(&channel_ctx->ctxlock, irq_flags);
+			if (index < FASTRPC_CTX_MAX && channel_ctx->ctxtable[index] == ctx)
+				ctx->is_job_sent_to_remote_ss = true;
+			spin_unlock_irqrestore(&channel_ctx->ctxlock, irq_flags);
+		}
+		ctx = &ctx_temp;
+	}
 	trace_fastrpc_rpmsg_send(cid, (uint64_t)ctx, msg->invoke.header.ctx,
 		handle, sc, msg->invoke.page.addr, msg->invoke.page.size);
 	ns = get_timestamp_in_ns();
@@ -3616,10 +3636,11 @@ static int fastrpc_wait_on_async_queue(
 			struct fastrpc_file *fl)
 {
 	int err = 0, ierr = 0, interrupted = 0, perfErr = 0;
-	struct smq_invoke_ctx *ctx = NULL, *ictx = NULL, *n = NULL;
+	struct smq_invoke_ctx *ctx = NULL, *ictx = NULL;
 	unsigned long flags;
 	uint64_t *perf_counter = NULL;
 	bool isworkdone = false;
+	struct hlist_node *n;
 
 read_async_job:
 	interrupted = wait_event_interruptible(fl->async_wait_queue,
@@ -3633,8 +3654,8 @@ read_async_job:
 		goto bail;
 
 	spin_lock_irqsave(&fl->aqlock, flags);
-	list_for_each_entry_safe(ictx, n, &fl->clst.async_queue, asyncn) {
-		list_del_init(&ictx->asyncn);
+	hlist_for_each_entry_safe(ictx, n, &fl->clst.async_queue, asyncn) {
+		hlist_del_init(&ictx->asyncn);
 		atomic_sub(1, &fl->async_queue_job_count);
 		ctx = ictx;
 		break;
