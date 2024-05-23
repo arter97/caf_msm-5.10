@@ -4210,6 +4210,14 @@ static int msm_geni_serial_sys_hib_resume(struct device *dev)
 		geni_write_reg_nolog(cfg1, uport->membase,
 				     SE_GENI_TX_PACKING_CFG1);
 		disable_irq(uport->irq);
+	} else {
+		/*
+		 * Peripheral register settings are lost during hibernation.
+		 * Update setup flag such that port setup happens again
+		 * during next session. Clients of HS-UART will close and
+		 * open the port during hibernation.
+		 */
+		port->port_setup = false;
 	}
 	return 0;
 }
