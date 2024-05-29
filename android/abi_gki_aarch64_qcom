@@ -2570,6 +2570,7 @@
   __traceiter_android_vh_binder_set_priority
   __traceiter_android_vh_binder_transaction_init
   __traceiter_android_vh_binder_wakeup_ilocked
+  __tracepoint_android_vh_check_hibernation_swap
   __traceiter_android_vh_check_uninterruptible_tasks
   __traceiter_android_vh_check_uninterruptible_tasks_dn
   __traceiter_android_vh_cpu_idle_enter
@@ -2600,6 +2601,8 @@
   __traceiter_android_vh_psi_group
   __traceiter_android_vh_rproc_recovery
   __traceiter_android_vh_rproc_recovery_set
+  __tracepoint_android_vh_save_cpu_resume
+  __tracepoint_android_vh_save_hib_resume_bdev
   __traceiter_android_vh_scheduler_tick
   __traceiter_android_vh_shmem_alloc_page
   __traceiter_android_vh_show_max_freq
