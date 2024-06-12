@@ -13,6 +13,7 @@
 #include "crypto-qti-ice-regs.h"
 #include "crypto-qti-platform.h"
 
+bool crypto_qti_hibernate_entry;
 static int ice_check_fuse_setting(void __iomem *ice_mmio)
 {
 	uint32_t regval;
@@ -305,6 +306,11 @@ int crypto_qti_keyslot_program(const struct ice_mmio_data *mmio_data,
 {
 	int err = 0;
 
+	if (crypto_qti_hibernate_entry) {
+		pr_err("%s: dont program key after hibernate entry\n", __func__);
+		return err;
+	}
+
 	err = crypto_qti_program_key(mmio_data, key, slot,
 				data_unit_mask, capid);
 	if (err) {
@@ -379,11 +385,19 @@ static int crypto_qti_hibernate_exit(void)
 
 static int qcom_crypto_hibernate_restore(struct device *dev)
 {
+	crypto_qti_hibernate_entry = false;
 	return crypto_qti_hibernate_exit();
+}
+
+static int qcom_crypto_hibernate_freeze(struct device *dev)
+{
+	crypto_qti_hibernate_entry = true;
+	return 0;
 }
 
 static const struct dev_pm_ops qcom_crypto_dev_pm_ops = {
 	.restore = qcom_crypto_hibernate_restore,
+	.freeze = qcom_crypto_hibernate_freeze,
 };
 
 static const struct of_device_id qti_crypto_match[] = {
