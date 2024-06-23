@@ -7,7 +7,9 @@
 
 #include <linux/crypto-qti-common.h>
 #include <linux/module.h>
-#include <linux/suspend.h>
+#include <linux/platform_device.h>
+#include <linux/mod_devicetable.h>
+#include <linux/qcom_scm.h>
 #include "crypto-qti-ice-regs.h"
 #include "crypto-qti-platform.h"
 
@@ -302,11 +304,6 @@ int crypto_qti_keyslot_program(const struct ice_mmio_data *mmio_data,
 			       u8 data_unit_mask, int capid)
 {
 	int err = 0;
-	void __iomem *ice_mmio =  mmio_data->ice_base_mmio;
-
-	if (mmio_data->reprogram_key &&
-	    ice_readl(ice_mmio, ICE_LUT_KEYS_CRYPTOCFG_R_16))
-		return err;
 
 	err = crypto_qti_program_key(mmio_data, key, slot,
 				data_unit_mask, capid);
@@ -366,6 +363,45 @@ int crypto_qti_derive_raw_secret(const u8 *wrapped_key,
 	return err;
 }
 EXPORT_SYMBOL(crypto_qti_derive_raw_secret);
+
+static int crypto_qti_hibernate_exit(void)
+{
+	int err = 0;
+
+	err = qcom_scm_hibernate_exit();
+	if (err == -EIO)
+		pr_err("%s:Hibernate exit SCM call unsupported in TZ\n", __func__);
+	else if (err != 0)
+		pr_err("%s:SCM call Error: 0x%x\n", __func__, err);
+
+	return err;
+}
+
+static int qcom_crypto_hibernate_restore(struct device *dev)
+{
+	return crypto_qti_hibernate_exit();
+}
+
+static const struct dev_pm_ops qcom_crypto_dev_pm_ops = {
+	.restore = qcom_crypto_hibernate_restore,
+};
+
+static const struct of_device_id qti_crypto_match[] = {
+	{ .compatible = "qcom,crypto" },
+	{},
+};
+MODULE_DEVICE_TABLE(of, qti_crypto_match);
+
+static struct platform_driver qti_crypto_driver = {
+	.probe		= NULL,
+	.remove		= NULL,
+	.driver		= {
+	.name		= "qti_crypto",
+	.pm		= &qcom_crypto_dev_pm_ops,
+	.of_match_table	= qti_crypto_match,
+	},
+};
+module_platform_driver(qti_crypto_driver);
 
 MODULE_LICENSE("GPL v2");
 MODULE_DESCRIPTION("Common crypto library for storage encryption");
