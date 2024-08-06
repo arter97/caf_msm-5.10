@@ -1519,6 +1519,9 @@ static __always_inline int __start_bw_hwmon(struct bw_hwmon *hw,
 		break;
 	}
 
+	mon_disable(m, type);
+	mon_clear(m, false, type);
+	mon_irq_clear(m, type);
 	ret = request_threaded_irq(m->irq, handler, bwmon_intr_thread,
 				  IRQF_ONESHOT | IRQF_SHARED,
 				  dev_name(m->dev), m);
@@ -1527,9 +1530,6 @@ static __always_inline int __start_bw_hwmon(struct bw_hwmon *hw,
 			ret);
 		return ret;
 	}
-
-	mon_disable(m, type);
-	mon_clear(m, false, type);
 
 	switch (type) {
 	case MON1:
