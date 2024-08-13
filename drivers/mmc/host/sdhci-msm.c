@@ -4680,6 +4680,9 @@ static int sdhci_msm_post_hibernation(struct sdhci_msm_host *msm_host)
 	if (!mhost->card)
 		return ret;
 
+	if (mhost->caps2 & MMC_CAP2_CRYPTO)
+		blk_ksm_reprogram_all_keys(&mhost->ksm);
+
 	mmc_get_card(mhost->card, NULL);
 
 #if IS_ENABLED(CONFIG_MMC_SDHCI_MSM_SCALING)
