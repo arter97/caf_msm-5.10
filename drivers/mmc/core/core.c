@@ -1003,7 +1003,8 @@ void mmc_set_initial_state(struct mmc_host *host)
 
 	mmc_set_ios(host);
 
-	mmc_crypto_set_initial_state(host);
+	if (!host->ops->dont_reprogram_allkeys)
+		mmc_crypto_set_initial_state(host);
 }
 EXPORT_SYMBOL_GPL(mmc_set_initial_state);
 
