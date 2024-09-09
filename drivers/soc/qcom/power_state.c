@@ -315,7 +315,7 @@ static long ps_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		break;
 
 	default:
-		printk(KERN_ALERT "Inside default in power_state.c due to %d\n",cmd);
+		pr_err("Inside default in power_state.c due to %d\n", cmd);
 		ret = -ENOIOCTLCMD;
 		pr_err("%s: Default\n", __func__);
 		break;
