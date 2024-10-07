@@ -39,7 +39,7 @@
 #include <asm/suspend.h>
 #include <asm/sysreg.h>
 #include <asm/virt.h>
-#include <linux/kfence.h>
+
 /*
  * Hibernate core relies on this value being 0 on resume, and marks it
  * __nosavedata assuming it will keep the resume kernel's '0' value. This
@@ -406,6 +406,7 @@ int swsusp_arch_suspend(void)
 	int ret = 0;
 	unsigned long flags;
 	struct sleep_stack_data state;
+
 	if (cpus_are_stuck_in_kernel()) {
 		pr_err("Can't hibernate: no mechanism to offline secondary CPUs.\n");
 		return -EBUSY;
@@ -472,8 +473,7 @@ static void _copy_pte(pte_t *dst_ptep, pte_t *src_ptep, unsigned long addr)
 		 * the temporary mappings we use during restore.
 		 */
 		set_pte(dst_ptep, pte_mkwrite(pte));
-	} else if ((debug_pagealloc_enabled() ||
-                    is_kfence_address((void *)addr)) && !pte_none(pte)) {
+	} else if (debug_pagealloc_enabled() && !pte_none(pte)) {
 		/*
 		 * debug_pagealloc will removed the PTE_VALID bit if
 		 * the page isn't in use by the resume kernel. It may have
@@ -710,6 +710,7 @@ int swsusp_arch_resume(void)
 
 		__hyp_set_vectors(el2_vectors);
 	}
+
 	hibernate_exit(virt_to_phys(tmp_pg_dir), resume_hdr.ttbr1_el1,
 		       resume_hdr.reenter_kernel, restore_pblist,
 		       resume_hdr.__hyp_stub_vectors, virt_to_phys(zero_page));
